@@ -1,0 +1,30 @@
+[package]
+name = "psplit"
+description = """
+Takes a file or stdin and splits it by -b bytes and sends them to the
+OUTPUT_COMMAND in parallel limited by -p concurrent jobs.
+
+Example:
+
+$ printf '012345678901234567890123' | \
+  psplit -b 10 sh -c 'cat > /tmp/psplit_$SEQ; echo >> /tmp/psplit_$SEQ'
+
+Will result in 3 files:
+/tmp/psplit_0 = "0123456789\n"
+/tmp/psplit_1 = "0123456789\n"
+/tmp/psplit_2 = "0123\n"
+"""
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+# async-lock = "2.5.0"
+async-std = "1.12.0"
+clap = { version = "3.2.14", features = ["derive"] }
+shlex = "1.1.0"
+semaphore = "0.4.0"
