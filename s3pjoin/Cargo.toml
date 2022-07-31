@@ -1,0 +1,35 @@
+[package]
+name = "pjoin"
+description = """
+Takes stdin commands split by new lines and executes them in parallel and
+prints stdout in order based on the order they are in stdin.
+
+Example:
+
+$ pjoin <<'EOT'
+sh -c 'printf foo; sleep 1'
+printf bar
+EOT
+
+Will result in:
+'foobar' (without quotes)
+"""
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[dependencies]
+async-std = "1.12.0"
+clap = { version = "3.2.14", features = ["derive"] }
+futures = "0.3.21"
+shlex = "1.1.0"
+nix = "0.24.2"
+libc = "0.2.126"
+aws-sdk-s3 = "0.16.0"
+aws-config = "0.46.0"
+tokio-stream = "0.1.9"
+bytes = "1.2.1"
