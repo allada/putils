@@ -1,0 +1,49 @@
+{
+	"folders":
+	[
+		{
+			"path": ".",
+		}
+	],
+	"settings":
+	{
+		"rsync_ssh":
+		{
+			"excludes":
+			[
+				".git*",
+				"_build",
+				"blib",
+				"Build",
+				"target"
+			],
+			"options":
+			[
+				"--delete"
+			],
+			"remotes":
+			{
+				"putils":
+				[
+					{
+						"command": "rsync",
+						"enabled": 1,
+						"excludes":
+						[
+						],
+						"options":
+						[
+						],
+						"remote_host": "54.218.254.140",
+						"remote_path": "/home/ubuntu/putils",
+						"remote_port": 22,
+						"remote_post_command": "",
+						"remote_pre_command": "",
+						"remote_user": "ubuntu"
+					}
+				]
+			},
+			"sync_on_save": true
+		}
+	},
+}

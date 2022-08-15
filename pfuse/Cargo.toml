@@ -1,0 +1,20 @@
+[package]
+name = "pfuse"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+polyfuse = "0.4.1"
+anyhow = "1.0.61"
+either = "1.7.0"
+slab = "0.4.7"
+tracing-subscriber = "0.3.15"
+tracing = "0.1.36"
+libc = "0.2.131"
+tokio = { version = "1.20.1", features = ["macros", "rt", "fs", "io-util", "rt-multi-thread"] }
+fast-async-mutex = "0.6.7"
+futures = "0.3.21"
+serde = "1.0.143"
+flexbuffers = "2.0.0"
