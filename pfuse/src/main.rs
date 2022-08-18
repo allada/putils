@@ -1,11 +1,12 @@
 #![warn(clippy::unimplemented, clippy::todo)]
 
+use std::os::unix::io::AsRawFd;
 use std::os::unix::prelude::RawFd;
 use core::sync::atomic::AtomicU64;
 use tokio::io::AsyncWriteExt;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use fast_async_mutex::mutex::MutexGuard;
+
 // use std::io::Read;
 // use std::io::Seek;
 mod fs;
@@ -27,7 +28,6 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use anyhow::Result;
 use either::Either;
 // use pico_args::Arguments;
-use slab::Slab;
 use std::{
     collections::hash_map::{Entry, HashMap},
     ffi::{OsStr, OsString},
@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
                 Operation::Lookup(op) => try_reply!(fs.do_lookup(op.parent(), op.name()).await),
                 Operation::Forget(forgets) => {
                     for forget in forgets.as_ref() {
-                        fs.forget_one(forget.ino(), forget.nlookup());
+                        fs.forget_one(forget.ino(), forget.nlookup()).await;
                     }
                 }
                 Operation::Getattr(op) => try_reply!(fs.do_getattr(&op).await),
@@ -168,8 +168,9 @@ struct ReadStats {
 impl ReadStats {
     fn new(ino: Ino, parent_map: Weak<Mutex<HashMap<Ino, Weak<ReadStats>>>>, file_size: usize) -> Self {
         println!("Creating");
-        let mut stats = Vec::with_capacity(file_size >> SLICE_MASK);
-        stats.resize(file_size >> SLICE_MASK, 0);
+        // let mut stats = Vec::with_capacity(file_size >> SLICE_MASK);
+        // stats.resize(file_size >> SLICE_MASK, 0);
+        let stats = Vec::new();
         Self {
             ino,
             parent_map,
@@ -248,16 +249,14 @@ impl WrappedFile {
 }
 
 struct Passthrough {
-    inodes: INodeTable,
-    opened_dirs: HandlePool<ReadDir>,
-    // opened_files: HandlePool<WrappedFile>,
+    inodes: Mutex<INodeTable>,
+    opened_dirs: Mutex<HashMap<RawFd, ReadDir>>,
+    opened_files: Mutex<HashMap<RawFd, WrappedFile>>,
     file_stats_map: Arc<Mutex<HashMap<Ino, Weak<ReadStats>>>>,
-
-    open_files: Mutex<HashMap<RawFd, File>>,
 }
 
 impl Passthrough {
-    fn new(source: PathBuf, inode_index_folder: PathBuf) -> io::Result<Self> {
+    fn new(source: PathBuf, _inode_index_folder: PathBuf) -> io::Result<Self> {
         let source = source.canonicalize()?;
         tracing::debug!("source={:?}", source);
         let fd = FileDesc::open(&source, libc::O_PATH)?;
@@ -269,22 +268,22 @@ impl Passthrough {
         entry.insert(INode {
             ino: 1,
             fd,
-            refcount: AtomicU64::new(u64::max_value() / 2), // the root node's cache is never removed.
+            refcount: u64::max_value() / 2, // the root node's cache is never removed.
             src_id: (stat.st_ino, stat.st_dev),
             is_symlink: false,
         });
 
         Ok(Self {
-            inodes,
-            opened_dirs: HandlePool::new(inode_index_folder.clone()),
-            // opened_files: HandlePool::new(inode_index_folder),
+            inodes: Mutex::new(inodes),
+            opened_dirs: Mutex::new(HashMap::new()),
+            opened_files: Mutex::new(HashMap::new()),
             file_stats_map: Arc::new(Mutex::new(HashMap::new())),
-            open_files: Mutex::new(HashMap::new()),
         })
     }
 
     async fn do_lookup(&self, parent: Ino, name: &OsStr) -> io::Result<EntryOut> {
-        let parent = self.inodes.get(parent).ok_or_else(no_entry)?;
+        let mut inodes = self.inodes.lock().await;
+        let parent = inodes.get(parent).ok_or_else(no_entry)?;
 
         let fd = parent.fd.openat(name, libc::O_PATH | libc::O_NOFOLLOW)?;
 
@@ -293,10 +292,11 @@ impl Passthrough {
         let is_symlink = stat.st_mode & libc::S_IFMT == libc::S_IFLNK;
 
         let ino;
-        match self.inodes.get_src(src_id) {
+        match inodes.get_src(src_id) {
             Some(inode) => {
                 ino = inode.ino;
-                let refcount = inode.refcount.fetch_add(1, Ordering::Relaxed);
+                inode.refcount += 1;
+                let refcount = inode.refcount;
                 tracing::debug!(
                     "update the lookup count: ino={}, refcount={}",
                     inode.ino,
@@ -304,13 +304,13 @@ impl Passthrough {
                 );
             }
             None => {
-                let entry = self.inodes.vacant_entry();
+                let entry = inodes.vacant_entry();
                 ino = entry.ino();
                 tracing::debug!("create a new inode cache: ino={}", ino);
                 entry.insert(INode {
                     ino,
                     fd,
-                    refcount: AtomicU64::new(1),
+                    refcount: 1,
                     src_id,
                     is_symlink,
                 });
@@ -320,12 +320,13 @@ impl Passthrough {
         Ok(make_entry_param(ino, stat))
     }
 
-    fn forget_one(&self, ino: Ino, nlookup: u64) {
-        if let Entry::Occupied(mut entry) = self.inodes.map.entry(ino) {
+    async fn forget_one(&self, ino: Ino, nlookup: u64) {
+        let mut inodes = self.inodes.lock().await;
+        if let Entry::Occupied(mut entry) = inodes.map.entry(ino) {
             let refcount = {
                 let mut inode = entry.get_mut();
-                let old_value = inode.refcount.fetch_sub(nlookup, Ordering::Relaxed);
-                old_value + nlookup
+                inode.refcount -= nlookup;
+                inode.refcount
             };
 
             if refcount == 0 {
@@ -336,7 +337,8 @@ impl Passthrough {
     }
 
     async fn do_getattr(&self, op: &op::Getattr<'_>) -> io::Result<AttrOut> {
-        let inode = self.inodes.get(op.ino()).ok_or_else(no_entry)?;
+        let inodes = self.inodes.lock().await;
+        let inode = inodes.get(op.ino()).ok_or_else(no_entry)?;
 
         let stat = inode.fd.fstatat("", libc::AT_SYMLINK_NOFOLLOW)?;
 
@@ -348,11 +350,14 @@ impl Passthrough {
 
     #[allow(clippy::cognitive_complexity)]
     async fn do_setattr(&self, op: &op::Setattr<'_>) -> io::Result<AttrOut> {
-        let inode = self.inodes.get(op.ino()).ok_or_else(no_entry)?;
+        let inodes = self.inodes.lock().await;
+        let inode = inodes.get(op.ino()).ok_or_else(no_entry)?;
         let fd = &inode.fd;
 
+        let opened_files = self.opened_files.lock().await;
+
         let mut wrapped_file = if let Some(fh) = op.fh() {
-            Some(self.opened_files.get(fh).await.ok_or_else(no_entry)?)
+            Some(opened_files.get(&(fh as RawFd)).ok_or_else(no_entry)?)
         } else {
             None
         };
@@ -435,14 +440,16 @@ impl Passthrough {
     }
 
     async fn do_readlink(&self, op: &op::Readlink<'_>) -> io::Result<OsString> {
-        let inode = self.inodes.get(op.ino()).ok_or_else(no_entry)?;
+        let inodes = self.inodes.lock().await;
+        let inode = inodes.get(op.ino()).ok_or_else(no_entry)?;
         inode.fd.readlinkat("")
     }
 
     async fn do_link(&self, op: &op::Link<'_>) -> io::Result<EntryOut> {
-        let parent_fd = self.inodes.get(op.newparent()).ok_or_else(no_entry)?.fd.clone();
+        let mut inodes = self.inodes.lock().await;
+        let parent_fd = inodes.get(op.newparent()).ok_or_else(no_entry)?.fd.clone();
 
-        let source = self.inodes.get(op.ino()).ok_or_else(no_entry)?;
+        let source = inodes.get_mut(op.ino()).ok_or_else(no_entry)?;
 
         if source.is_symlink {
             source
@@ -467,13 +474,13 @@ impl Passthrough {
         let stat = source.fd.fstatat("", libc::AT_SYMLINK_NOFOLLOW)?;
         let entry = make_entry_param(source.ino, stat);
 
-        source.refcount.fetch_add(1, Ordering::Relaxed);
+        source.refcount += 1;
 
         Ok(entry)
     }
 
     async fn make_node(
-        &mut self,
+        &self,
         parent: Ino,
         name: &OsStr,
         mode: u32,
@@ -481,7 +488,8 @@ impl Passthrough {
         link: Option<&OsStr>,
     ) -> io::Result<EntryOut> {
         {
-            let parent = self.inodes.get(parent).ok_or_else(no_entry)?;
+            let inodes = self.inodes.lock().await;
+            let parent = inodes.get(parent).ok_or_else(no_entry)?;
 
             match mode & libc::S_IFMT {
                 libc::S_IFDIR => {
@@ -502,13 +510,15 @@ impl Passthrough {
     }
 
     async fn do_unlink(&self, op: &op::Unlink<'_>) -> io::Result<()> {
-        let parent = self.inodes.get(op.parent()).ok_or_else(no_entry)?;
+        let inodes = self.inodes.lock().await;
+        let parent = inodes.get(op.parent()).ok_or_else(no_entry)?;
         parent.fd.unlinkat(op.name(), 0)?;
         Ok(())
     }
 
     async fn do_rmdir(&self, op: &op::Rmdir<'_>) -> io::Result<()> {
-        let parent = self.inodes.get(op.parent()).ok_or_else(no_entry)?;
+        let inodes = self.inodes.lock().await;
+        let parent = inodes.get(op.parent()).ok_or_else(no_entry)?;
         parent.fd.unlinkat(op.name(), libc::AT_REMOVEDIR)?;
         Ok(())
     }
@@ -519,8 +529,9 @@ impl Passthrough {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
         }
 
-        let parent = self.inodes.get(op.parent()).ok_or_else(no_entry)?;
-        let newparent = self.inodes.get(op.newparent()).ok_or_else(no_entry)?;
+        let inodes = self.inodes.lock().await;
+        let parent = inodes.get(op.parent()).ok_or_else(no_entry)?;
+        let newparent = inodes.get(op.newparent()).ok_or_else(no_entry)?;
 
         if op.parent() == op.newparent() {
             parent
@@ -536,12 +547,17 @@ impl Passthrough {
     }
 
     async fn do_opendir(&self, op: &op::Opendir<'_>) -> io::Result<OpenOut> {
-        let inode = self.inodes.get(op.ino()).ok_or_else(no_entry)?;
+        let inodes = self.inodes.lock().await;
+        let inode = inodes.get(op.ino()).ok_or_else(no_entry)?;
         let dir = inode.fd.read_dir()?;
-        let fh = self.opened_dirs.insert(dir).await;
+        let raw_fd = inode.fd.as_raw_fd();
+        {
+            let mut opened_dirs = self.opened_dirs.lock().await;
+            opened_dirs.insert(raw_fd, dir);
+        }
 
         let mut out = OpenOut::default();
-        out.fh(fh);
+        out.fh(raw_fd as u64);
 
         Ok(out)
     }
@@ -551,10 +567,10 @@ impl Passthrough {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
 
-        let mut read_dir = self
-            .opened_dirs
-            .get(op.fh())
-            .await
+        let mut opened_dirs = self.opened_dirs.lock().await;
+        let read_dir =
+            opened_dirs
+            .get_mut(&(op.fh() as RawFd))
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
         read_dir.seek(op.offset());
 
@@ -570,7 +586,8 @@ impl Passthrough {
     }
 
     async fn do_fsyncdir(&self, op: &op::Fsyncdir<'_>) -> io::Result<()> {
-        let read_dir = self.opened_dirs.get(op.fh()).await.ok_or_else(no_entry)?;
+        let mut opened_dirs = self.opened_dirs.lock().await;
+        let read_dir = opened_dirs.get_mut(&(op.fh() as RawFd)).ok_or_else(no_entry)?;
 
         if op.datasync() {
             read_dir.sync_data()?;
@@ -582,12 +599,14 @@ impl Passthrough {
     }
 
     async fn do_releasedir(&self, op: &op::Releasedir<'_>) -> io::Result<()> {
-        self.opened_dirs.remove(op.fh());
+        let mut opened_dirs = self.opened_dirs.lock().await;
+        opened_dirs.remove(&(op.fh() as RawFd));
         Ok(())
     }
 
     async fn do_open(&self, op: &op::Open<'_>) -> io::Result<OpenOut> {
-        let inode = self.inodes.get(op.ino()).ok_or_else(no_entry)?;
+        let inodes = self.inodes.lock().await;
+        let inode = inodes.get(op.ino()).ok_or_else(no_entry)?;
 
         let mut options = OpenOptions::new();
         match (op.flags() & 0x03) as i32 {
@@ -635,33 +654,51 @@ impl Passthrough {
                 }
             }
         };
-        // let len = file.metadata().await?.len() as usize;
-        let fh = self.opened_files.insert(WrappedFile::new(file, read_stats).await?).await;
+        let raw_fd = file.as_raw_fd();
+        {
+            let mut opened_files = self.opened_files.lock().await;
+            opened_files.insert(raw_fd, WrappedFile::new(file, read_stats).await?);
+        }
 
         let mut out = OpenOut::default();
-        out.fh(fh);
+        out.fh(raw_fd as u64);
 
         Ok(out)
     }
 
     async fn do_read(&self, op: &op::Read<'_>) -> io::Result<Vec<u8>> {
-        let mut wrapped_file = self.opened_files.get(op.fh()).await.ok_or_else(no_entry)?;
+        let fh = op.fh() as RawFd;
+        // let mut opened_files = self.opened_files.lock().await;
+        // let wrapped_file = opened_files.get_mut(&(op.fh() as RawFd)).ok_or_else(no_entry)?;
 
-        wrapped_file.file.seek(io::SeekFrom::Start(op.offset())).await?;
+        // libc::lseek(fh, op.offset() as i64, libc::SEEK_SET);
 
-        tokio::spawn(wrapped_file.read_stats.clone().touch(op.offset(), op.offset() + op.size() as u64));
+        // wrapped_file.file.seek(io::SeekFrom::Start(op.offset())).await?;
 
-        let mut buf = Vec::<u8>::with_capacity(op.size() as usize);
-        (&mut wrapped_file.file).take(op.size() as u64).read_to_end(&mut buf).await?;
+        // tokio::spawn(wrapped_file.read_stats.clone().touch(op.offset(), op.offset() + op.size() as u64));
 
-        Ok(buf)
+        let size = op.size() as usize;
+        let offset = op.offset() as i64;
+        // tokio::task::spawn_blocking(move || {
+            let mut buf = Vec::<u8>::with_capacity(size);
+            unsafe {
+                let bytes_read = libc::pread(fh, buf.as_mut_ptr() as *mut libc::c_void, size, offset);
+                buf.set_len(std::cmp::min(bytes_read as usize, size));
+            }
+            Ok(buf)
+        // }).await?
+
+        // (&mut wrapped_file.file).take(op.size() as u64).read_to_end(&mut buf).await?;
+
+        
     }
 
     async fn do_write<T>(&self, op: &op::Write<'_>, mut data: T) -> io::Result<WriteOut>
     where
         T: BufRead + Unpin,
     {
-        let mut wrapped_file = self.opened_files.get(op.fh()).await.ok_or_else(no_entry)?;
+        let mut opened_files = self.opened_files.lock().await;
+        let wrapped_file = opened_files.get_mut(&(op.fh() as RawFd)).ok_or_else(no_entry)?;
 
         wrapped_file.file.seek(io::SeekFrom::Start(op.offset())).await?;
 
@@ -677,7 +714,7 @@ impl Passthrough {
 
         // let mut buf = std::io::Read::take(&mut buf, op.size() as u64);
         let mut cursor = std::io::Cursor::new(&buf[..op.size() as usize]);
-        let written = tokio::io::copy(&mut cursor, &mut wrapped_file.file).await?;
+        let written = 0; // tokio::io::copy(&mut cursor, &mut wrapped_file.file).await?;
 
         let mut out = WriteOut::default();
         out.size(written as u32);
@@ -686,7 +723,8 @@ impl Passthrough {
     }
 
     async fn do_flush(&self, op: &op::Flush<'_>) -> io::Result<()> {
-        let wrapped_file = self.opened_files.get(op.fh()).await.ok_or_else(no_entry)?;
+        let mut opened_files = self.opened_files.lock().await;
+        let wrapped_file = opened_files.get_mut(&(op.fh() as RawFd)).ok_or_else(no_entry)?;
 
         wrapped_file.file.sync_all().await?;
 
@@ -694,7 +732,8 @@ impl Passthrough {
     }
 
     async fn do_fsync(&self, op: &op::Fsync<'_>) -> io::Result<()> {
-        let wrapped_file = self.opened_files.get(op.fh()).await.ok_or_else(no_entry)?;
+        let mut opened_files = self.opened_files.lock().await;
+        let wrapped_file = opened_files.get_mut(&(op.fh() as RawFd)).ok_or_else(no_entry)?;
 
         if op.datasync() {
             wrapped_file.file.sync_data().await?;
@@ -706,7 +745,8 @@ impl Passthrough {
     }
 
     async fn do_flock(&self, op: &op::Flock<'_>) -> io::Result<()> {
-        let wrapped_file = self.opened_files.get(op.fh()).await.ok_or_else(no_entry)?;
+        let mut opened_files = self.opened_files.lock().await;
+        let wrapped_file = opened_files.get_mut(&(op.fh() as RawFd)).ok_or_else(no_entry)?;
 
         let op = op.op().expect("invalid lock operation") as i32;
 
@@ -720,7 +760,8 @@ impl Passthrough {
             return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
         }
 
-        let wrapped_file = self.opened_files.get(op.fh()).await.ok_or_else(no_entry)?;
+        let mut opened_files = self.opened_files.lock().await;
+        let wrapped_file = opened_files.get_mut(&(op.fh() as RawFd)).ok_or_else(no_entry)?;
 
         fs::posix_fallocate(&wrapped_file.file, op.offset() as i64, op.length() as i64)?;
 
@@ -728,15 +769,17 @@ impl Passthrough {
     }
 
     async fn do_release(&self, op: &op::Release<'_>) -> io::Result<()> {
-        self.opened_files.remove(op.fh());
+        let mut opened_files = self.opened_files.lock().await;
+        opened_files.remove(&(op.fh() as RawFd));
         Ok(())
     }
 
     async fn do_getxattr(
-        &mut self,
+        &self,
         op: &op::Getxattr<'_>,
     ) -> io::Result<impl polyfuse::bytes::Bytes + Debug> {
-        let inode = self.inodes.get(op.ino()).ok_or_else(no_entry)?;
+        let inodes = self.inodes.lock().await;
+        let inode = inodes.get(op.ino()).ok_or_else(no_entry)?;
 
         if inode.is_symlink {
             // no race-free way to getxattr on symlink.
@@ -760,10 +803,11 @@ impl Passthrough {
     }
 
     async fn do_listxattr(
-        &mut self,
+        &self,
         op: &op::Listxattr<'_>,
     ) -> io::Result<impl polyfuse::bytes::Bytes + Debug> {
-        let inode = self.inodes.get(op.ino()).ok_or_else(no_entry)?;
+        let inodes = self.inodes.lock().await;
+        let inode = inodes.get(op.ino()).ok_or_else(no_entry)?;
 
         if inode.is_symlink {
             // no race-free way to getxattr on symlink.
@@ -787,7 +831,8 @@ impl Passthrough {
     }
 
     async fn do_setxattr(&self, op: &op::Setxattr<'_>) -> io::Result<()> {
-        let inode = self.inodes.get(op.ino()).ok_or_else(no_entry)?;
+        let inodes = self.inodes.lock().await;
+        let inode = inodes.get(op.ino()).ok_or_else(no_entry)?;
 
         if inode.is_symlink {
             // no race-free way to getxattr on symlink.
@@ -805,7 +850,8 @@ impl Passthrough {
     }
 
     async fn do_removexattr(&self, op: &op::Removexattr<'_>) -> io::Result<()> {
-        let inode = self.inodes.get(op.ino()).ok_or_else(no_entry)?;
+        let inodes = self.inodes.lock().await;
+        let inode = inodes.get(op.ino()).ok_or_else(no_entry)?;
 
         if inode.is_symlink {
             // no race-free way to getxattr on symlink.
@@ -818,7 +864,8 @@ impl Passthrough {
     }
 
     async fn do_statfs(&self, op: &op::Statfs<'_>) -> io::Result<StatfsOut> {
-        let inode = self.inodes.get(op.ino()).ok_or_else(no_entry)?;
+        let inodes = self.inodes.lock().await;
+        let inode = inodes.get(op.ino()).ok_or_else(no_entry)?;
 
         let st = fs::fstatvfs(&inode.fd)?;
 
@@ -855,46 +902,6 @@ fn fill_statfs(statfs: &mut Statfs, st: &libc::statvfs) {
     statfs.namelen(st.f_namemax as u32);
 }
 
-// ==== HandlePool ====
-
-struct HandlePool<T> {
-    slab: Mutex<Slab<Arc<Mutex<T>>>>,
-    inode_index_folder: PathBuf,
-}
-
-impl<T> HandlePool<T> {
-    fn new(inode_index_folder: PathBuf) -> Self {
-        Self {
-            slab: Default::default(),
-            inode_index_folder,
-        }
-    }
-
-    async fn get(&self, fh: u64) -> Option<Arc<MutexGuard<T>>> {
-        let slab = self.slab.lock().await;
-        match slab.get(fh as usize) {
-            Some(v) => Some(v.lock().await.clone()),
-            _ => None
-        }
-    }
-
-    async fn get_mut(&mut self, fh: u64) -> Option<MutexGuard<T>> {
-        let slab = self.slab.lock().await;
-        match slab.get_mut(fh as usize) {
-            Some(v) => Some(v.lock().await),
-            _ => None
-        }
-    }
-
-    async fn remove(&mut self, fh: u64) {
-        self.slab.lock().await.remove(fh as usize);
-    }
-
-    async fn insert(&mut self, entry: T) -> u64 {
-        self.slab.lock().await.insert(Mutex::new(entry)) as u64
-    }
-}
-
 // ==== INode ====
 
 struct INode {
@@ -902,7 +909,7 @@ struct INode {
     src_id: SrcId,
     is_symlink: bool,
     fd: FileDesc,
-    refcount: AtomicU64,
+    refcount: u64,
 }
 
 // ==== INodeTable ====
@@ -935,14 +942,14 @@ impl INodeTable {
         self.map.get_mut(ino)
     }
 
-    fn vacant_entry(&self) -> VacantEntry<'_> {
+    fn vacant_entry(&mut self) -> VacantEntry<'_> {
         let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
         VacantEntry { table: self, ino }
     }
 }
 
 struct VacantEntry<'a> {
-    table: &'a INodeTable,
+    table: &'a mut INodeTable,
     ino: Ino,
 }
 
