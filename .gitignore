@@ -2,3 +2,4 @@ pjoin/target
 psplit/target
 s3pjoin/target
 pfuse/target
+*.sublime-*

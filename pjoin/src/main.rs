@@ -1,8 +1,7 @@
 // Copyright 2022 Nathan (Blaise) Bruer.  All rights reserved.
 
 use std::fs::OpenOptions;
-use std::io::{stdin, stdout, BufRead, BufReader, Read};
-use std::io::{IoSlice, Write};
+use std::io::{stdin, stdout, BufRead, BufReader, Read, IoSlice, Write};
 use std::os::unix::prelude::AsRawFd;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{sync_channel, Receiver};
@@ -10,15 +9,29 @@ use std::thread::{spawn, JoinHandle};
 
 use async_std::task;
 use clap::Parser;
-use futures::future::ready;
-use futures::{stream, StreamExt};
+use futures::{future::ready, stream, StreamExt};
 use nix::fcntl::{vmsplice, SpliceFFlags};
 use shlex;
+use lazy_static::lazy_static;
+
+mod aligned_buffer_pool;
+use crate::aligned_buffer_pool::{AlignedBufferPool, Buffer};
 
 const DEFAULT_CONCURRENT_LIMIT: usize = 16;
 const DEFAULT_BUFFER_SIZE: usize = 1 << 30; // 1Gb
 
-const CHUNK_BUFFER_SIZE: usize = 2 * 1024 * 1024; // 2mb
+/// Number of cooldown buffers. We share some buffers with the kernel when we pipe data to another
+/// process and we don't get any notifications telling us when it's been used, so we need to rely
+/// on the blocking action of the kernel calls and the known size of the internal kernel pipe
+/// buffers. To simplify this we keep items in a cooldown queue to prevent us from writing to it
+/// while the kernel might be reading from it.
+const MAX_COOLDOWN_BUFFERS: usize = 4;
+
+const TWO_MB_IN_BITS: usize = 21;
+const TWO_MB: usize = 1 << TWO_MB_IN_BITS;
+lazy_static! {
+    static ref BUFFER_POOL: AlignedBufferPool<TWO_MB_IN_BITS> = AlignedBufferPool::<TWO_MB_IN_BITS>::new(MAX_COOLDOWN_BUFFERS);
+}
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -36,10 +49,10 @@ struct Args {
     output_file: Option<String>,
 }
 
-fn collect_and_write_data<S, F>(mut process_stream: S, mut write_fn: F)
+fn collect_and_write_data<S, F, const BIT_ALIGNMENT: usize>(mut process_stream: S, mut write_fn: F)
 where
-    S: futures::Stream<Item = (Receiver<Vec<u8>>, JoinHandle<()>)> + std::marker::Unpin,
-    F: FnMut(Vec<u8>),
+    S: futures::Stream<Item = (Receiver<Buffer<BIT_ALIGNMENT>>, JoinHandle<()>)> + std::marker::Unpin,
+    F: FnMut(Buffer<BIT_ALIGNMENT>),
 {
     task::block_on(async {
         while let Some((rx, thread_join)) = process_stream.next().await {
@@ -68,30 +81,32 @@ fn main() {
             let mut child_process = match command_builder.spawn() {
                 Ok(child_process) => child_process,
                 Err(e) => {
-                    println!("Could not run command '{}'", full_command);
+                    eprintln!("Could not run command '{}'", full_command);
                     panic!("{}", e);
                 }
             };
-            let (tx, rx) = sync_channel(args.buffer_size / CHUNK_BUFFER_SIZE);
+            let (tx, rx) = sync_channel(args.buffer_size / TWO_MB);
 
             let thread_join = spawn(move || {
                 let mut stdout = child_process.stdout.take().unwrap();
                 loop {
-                    let mut buffer = Vec::with_capacity(CHUNK_BUFFER_SIZE);
+                    let mut buffer = BUFFER_POOL.get();
                     unsafe {
-                        buffer.set_len(CHUNK_BUFFER_SIZE);
+                        buffer.set_len(buffer.capacity());
                     }
                     let mut bytes_read = 0;
-                    while bytes_read <= CHUNK_BUFFER_SIZE {
+                    while bytes_read <= TWO_MB {
                         let len = stdout
-                            .read(&mut buffer[bytes_read..CHUNK_BUFFER_SIZE])
+                            .read(&mut buffer[bytes_read..TWO_MB])
                             .unwrap();
                         if len == 0 {
                             break;
                         }
                         bytes_read += len;
                     }
-                    buffer.truncate(bytes_read);
+                    unsafe {
+                        buffer.set_len(bytes_read);
+                    }
                     if bytes_read == 0 {
                         let exit_code = child_process.wait().unwrap();
                         assert!(exit_code.success());
