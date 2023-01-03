@@ -1,0 +1,12 @@
+[package]
+name = "mmap_benchmark"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+nix = {version = "0.26.1", features = ["mman"]}
+libc = "0.2.132"
+rand = "0.8.5"
+microbench = "0.5.0"
