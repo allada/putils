@@ -100,10 +100,12 @@ fn main() {
     }
     let random_locations = make_random_locations(file_len as usize);
     {
-        let file = OpenOptions::new()
-            .read(true)
-            .open(FILE_FULL_PATH)
-            .unwrap();
+        let file = unsafe {
+            let file_full_path_null_terminated: String = format!("{}\0", FILE_FULL_PATH);
+            let raw_fd = libc::open(file_full_path_null_terminated.as_ptr().cast(), libc::O_DIRECT | libc::O_NOATIME);
+            assert!(raw_fd != -1, "bad fd");
+            File::from_raw_fd(raw_fd)
+        };
         let buffer = unsafe {
             const TWO_MB: usize = 1 << 21;
             let mut data_ptr = std::ptr::null_mut::<libc::c_void>();
